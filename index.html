@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -881,15 +882,57 @@ const TOPICS = [
 ];
 
 // =================== STORAGE// =================== STORAGE ===================
+// ── Supabase cloud storage ──
+const SUPA_URL='https://jrzxevwkuxdkxqhifmse.supabase.co';
+const SUPA_KEY='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImpyenhldndrdXhka3hxaGlmbXNlIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzk4NzgwNTUsImV4cCI6MjA5NTQ1NDA1NX0.oAFJa5k7VjmNeX-oaTtrK9tEOTyOudJRnSShkg2XXCA';
+
+// In-memory cache so we don't re-fetch on every pick()
+const _statsCache={};
+
+async function supaLoad(staffId){
+  if(_statsCache[staffId]) return _statsCache[staffId];
+  try{
+    const r=await fetch(SUPA_URL+'/rest/v1/scores?staff_id=eq.'+staffId+'&select=data',{headers:{'apikey':SUPA_KEY,'Authorization':'Bearer '+SUPA_KEY}});
+    const rows=await r.json();
+    if(rows&&rows.length>0){const d=JSON.parse(rows[0].data);_statsCache[staffId]=d;return d;}
+  }catch(e){}
+  return null;
+}
+
+async function supaSave(staffId,data){
+  _statsCache[staffId]=data;
+  try{
+    await fetch(SUPA_URL+'/rest/v1/scores',{
+      method:'POST',
+      headers:{'apikey':SUPA_KEY,'Authorization':'Bearer '+SUPA_KEY,'Content-Type':'application/json','Prefer':'resolution=merge-duplicates'},
+      body:JSON.stringify({staff_id:staffId,data:JSON.stringify(data),updated_at:new Date().toISOString()})
+    });
+  }catch(e){}
+}
+
+// Local helpers — used only for pins, topics, settings (not scores)
 function gS(k,fb){try{const v=localStorage.getItem(k);return v!==null?JSON.parse(v):fb;}catch(e){return fb;}}
 function sS(k,v){try{localStorage.setItem(k,JSON.stringify(v));}catch(e){}}
 
 function getPins(){return gS('mch_pins',{...DEFAULT_PINS});}
 function setPins(p){sS('mch_pins',p);}
-function getStats(id){return gS('mch_stats_'+id,{attempts:0,correct:0,byTopic:{}});}
-function setStats(id,d){sS('mch_stats_'+id,d);}
-function getLastActive(id){return gS('mch_last_'+id,null);}
-function setLastActive(id){sS('mch_last_'+id,new Date().toLocaleDateString('en-GB',{day:'2-digit',month:'short'}));}
+function getStatsSync(id){
+  // Returns cached or empty — use only where async not possible
+  return _statsCache[id]||{attempts:0,correct:0,byTopic:{},bySkill:{},wrongLog:[]};
+}
+async function getStats(id){
+  const cached=await supaLoad(id);
+  if(cached){_statsCache[id]=cached;return cached;}
+  return {attempts:0,correct:0,byTopic:{},bySkill:{},wrongLog:[]};
+}
+async function setStats(id,d){await supaSave(id,d);}
+function getLastActive(id){
+  const s=_statsCache[id];
+  return s&&s.lastActive?s.lastActive:null;
+}
+function setLastActive(id){
+  if(_statsCache[id]) _statsCache[id].lastActive=new Date().toLocaleDateString('en-GB',{day:'2-digit',month:'short'});
+}
 
 function getTopics(){
   const saved=gS('mch_topics',null);
@@ -1192,9 +1235,8 @@ One correct:true only. Shuffle so correct is not always first. Options 1-2 sente
   }
 }
 
-function showTopicComplete(){
-  // Calculate session score for this topic
-  const stats=getStats(currentUser.id);
+async function showTopicComplete(){
+  const stats=await getStats(currentUser.id);
   const ts=(stats.byTopic&&stats.byTopic[currentTopic.id])||{a:0,c:0};
   const topicCorrect=ts.c||0;
   const topicAttempts=ts.a||0;
@@ -1308,7 +1350,7 @@ function pick(idx){
     });
     if(stats.wrongLog.length>50)stats.wrongLog=stats.wrongLog.slice(-50);
   }
-  setStats(currentUser.id,stats);
+  setStats(currentUser.id,stats); // async fire-and-forget
   setLastActive(currentUser.id);
   document.getElementById('t-score').textContent=sessionScore;
   document.getElementById('t-total').textContent=sessionTotal;
@@ -1355,7 +1397,7 @@ function switchTab(name){
 // =================== ANALYSIS ===================
 async function runAnalysis(){
   const rec=STAFF.filter(s=>s.id!=='mgmt');
-  const allStats=rec.map(s=>({staff:s,stats:getStats(s.id)}));
+  const allStats=rec.map(s=>({staff:s,stats:getStatsSync(s.id)}));
   const totalAttempts=allStats.reduce((s,x)=>s+x.stats.attempts,0);
 
   if(totalAttempts===0){
@@ -1544,8 +1586,12 @@ ${dataSummary}`}]
   document.getElementById('btn-run-analysis').disabled=false;
 }
 
-function showMgmt(){
+async function showMgmt(){
+  topics=getTopics();
   show('screen-mgmt');
+  // Pre-load all staff stats from Supabase before rendering
+  const rec=STAFF.filter(s=>s.id!=='mgmt');
+  await Promise.all(rec.map(s=>getStats(s.id)));
   renderMgmtOverview();
   renderMgmtStaff();
   renderScenarioManager();
@@ -1555,24 +1601,24 @@ function showMgmt(){
 function renderMgmtOverview(){
   const rec=STAFF.filter(s=>s.id!=='mgmt');
   let ta=0,tc=0;
-  rec.forEach(s=>{const st=getStats(s.id);ta+=st.attempts;tc+=st.correct;});
+  rec.forEach(s=>{const st=getStatsSync(s.id);ta+=st.attempts;tc+=st.correct;});
   const rate=ta>0?Math.round((tc/ta)*100):0;
-  const active=rec.filter(s=>getStats(s.id).attempts>0).length;
-  const top=rec.filter(s=>getStats(s.id).attempts>0).sort((a,b)=>{
-    const sa=getStats(a.id),sb=getStats(b.id);
+  const active=rec.filter(s=>getStatsSync(s.id).attempts>0).length;
+  const top=rec.filter(s=>getStatsSync(s.id).attempts>0).sort((a,b)=>{
+    const sa=getStatsSync(a.id),sb=getStatsSync(b.id);
     return(sb.correct/sb.attempts)-(sa.correct/sa.attempts);
   })[0];
   document.getElementById('mgmt-metrics').innerHTML=`
     <div class="metric-card"><p class="metric-label">Total attempts</p><p class="metric-value">${ta}</p><p class="metric-sub">all staff</p></div>
     <div class="metric-card"><p class="metric-label">Pass rate</p><p class="metric-value">${rate}%</p><p class="metric-sub">overall</p></div>
     <div class="metric-card"><p class="metric-label">Active staff</p><p class="metric-value">${active}<span style="font-size:16px;font-family:'DM Sans',sans-serif;color:var(--text2)">/5</span></p><p class="metric-sub">have trained</p></div>
-    <div class="metric-card"><p class="metric-label">Top performer</p><p class="metric-value" style="font-size:${top?'18px':'28px'};font-family:'DM Sans',sans-serif;">${top?top.name:'—'}</p><p class="metric-sub">${top?Math.round((getStats(top.id).correct/getStats(top.id).attempts)*100)+'% correct':'no data yet'}</p></div>
+    <div class="metric-card"><p class="metric-label">Top performer</p><p class="metric-value" style="font-size:${top?'18px':'28px'};font-family:'DM Sans',sans-serif;">${top?top.name:'—'}</p><p class="metric-sub">${top?Math.round((getStatsSync(top.id).correct/getStatsSync(top.id).attempts)*100)+'% correct':'no data yet'}</p></div>
   `;
   const tbody=document.getElementById('topic-tbody');
   tbody.innerHTML='';
   topics.forEach(topic=>{
     let ta2=0,tc2=0;
-    rec.forEach(s=>{const st=getStats(s.id);if(st.byTopic&&st.byTopic[topic.id]){ta2+=st.byTopic[topic.id].a;tc2+=st.byTopic[topic.id].c;}});
+    rec.forEach(s=>{const st=getStatsSync(s.id);if(st.byTopic&&st.byTopic[topic.id]){ta2+=st.byTopic[topic.id].a;tc2+=st.byTopic[topic.id].c;}});
     const r2=ta2>0?Math.round((tc2/ta2)*100):null;
     tbody.innerHTML+=`<tr>
       <td>${topic.icon} ${topic.name}</td><td>${ta2}</td>
@@ -1587,9 +1633,9 @@ function renderMgmtStaff(){
   const tbody=document.getElementById('mgmt-tbody');
   tbody.innerHTML='';
   rec.forEach(s=>{
-    const st=getStats(s.id);
+    const st=getStatsSync(s.id);
     const rate=st.attempts>0?Math.round((st.correct/st.attempts)*100):null;
-    const last=getLastActive(s.id);
+    const last=(getStatsSync(s.id).lastActive)||null;
     const tr=document.createElement('tr');
     tr.className='clickable-row';
     tr.innerHTML=`
@@ -1609,13 +1655,13 @@ function openStaffDetail(s){
   av.className='avatar '+s.avClass;
   av.textContent=s.initials;
   document.getElementById('det-name').textContent=s.name;
-  const stats=getStats(s.id);
+  const stats=getStatsSync(s.id);
   const rate=stats.attempts>0?Math.round((stats.correct/stats.attempts)*100):0;
   document.getElementById('det-metrics').innerHTML=`
     <div class="metric-card"><p class="metric-label">Total attempts</p><p class="metric-value">${stats.attempts}</p></div>
     <div class="metric-card"><p class="metric-label">Correct</p><p class="metric-value">${stats.correct}</p></div>
     <div class="metric-card"><p class="metric-label">Pass rate</p><p class="metric-value">${stats.attempts>0?rate+'%':'—'}</p></div>
-    <div class="metric-card"><p class="metric-label">Last active</p><p class="metric-value" style="font-size:18px;font-family:'DM Sans',sans-serif;">${getLastActive(s.id)||'Never'}</p></div>
+    <div class="metric-card"><p class="metric-label">Last active</p><p class="metric-value" style="font-size:18px;font-family:'DM Sans',sans-serif;">${stats.lastActive||'Never'}</p></div>
   `;
   const bd=document.getElementById('det-breakdown');
   bd.innerHTML='';
@@ -1750,11 +1796,9 @@ function savePin(sid){
 
 function resetAllData(){
   if(!confirm('Are you sure? This will permanently erase ALL training data for all staff members. This cannot be undone.'))return;
-  STAFF.filter(s=>s.id!=='mgmt').forEach(s=>{
-    localStorage.removeItem('mch_stats_'+s.id);
-    localStorage.removeItem('mch_last_'+s.id);
-    localStorage.removeItem('mch_tags_'+s.id);
-  });
+  const resetRec=STAFF.filter(s=>s.id!=='mgmt');
+  await Promise.all(resetRec.map(s=>supaSave(s.id,{attempts:0,correct:0,byTopic:{},bySkill:{},wrongLog:[]})));
+  resetRec.forEach(s=>{delete _statsCache[s.id];});
   alert('All training data has been reset.');
   renderMgmtOverview();renderMgmtStaff();
 }
